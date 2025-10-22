@@ -20,7 +20,34 @@ else:
     logging.info("YOLOv3 will run on CPU")
 
 class WeightReader:
+    """
+    Reader for loading YOLOv3 pre-trained weights from Darknet format.
+
+    This class reads binary weight files in the Darknet format (.weights)
+    and loads them into a Keras model. Handles version compatibility and
+    proper weight ordering for convolutional and batch normalization layers.
+
+    Attributes:
+        offset (int): Current position in the weight array
+        all_weights (np.ndarray): All weights loaded from file as float32
+
+    Example:
+        >>> model = make_yolov3_model()
+        >>> weight_reader = WeightReader('yolov3.weights')
+        >>> weight_reader.load_weights(model)
+        >>> # Model is now ready for inference
+    """
     def __init__(self, weight_file):
+        """
+        Initialize weight reader and load weights from file.
+
+        Args:
+            weight_file (str): Path to Darknet weights file (.weights)
+
+        Raises:
+            FileNotFoundError: If weight file doesn't exist
+            struct.error: If file format is invalid
+        """
         with open(weight_file, 'rb') as w_f:
             major,    = struct.unpack('i', w_f.read(4))
             minor,    = struct.unpack('i', w_f.read(4))
@@ -32,17 +59,46 @@ class WeightReader:
                 w_f.read(4)
 
             transpose = (major > 1000) or (minor > 1000)
-            
+
             binary = w_f.read()
 
         self.offset = 0
         self.all_weights = np.frombuffer(binary, dtype='float32')
-        
+
     def read_bytes(self, size):
+        """
+        Read specified number of weights from current position.
+
+        Args:
+            size (int): Number of weight values to read
+
+        Returns:
+            np.ndarray: Array of weight values
+        """
         self.offset = self.offset + size
         return self.all_weights[self.offset-size:self.offset]
 
     def load_weights(self, model):
+        """
+        Load pre-trained weights into YOLOv3 Keras model.
+
+        Iterates through all 106 convolutional layers in YOLOv3 and loads
+        weights from the Darknet format, handling both batch normalization
+        and bias parameters correctly.
+
+        Args:
+            model (keras.Model): YOLOv3 model created by make_yolov3_model()
+
+        Note:
+            Layers 81, 93, and 105 are detection layers without batch norm.
+            Weights are transposed from Darknet [out, in, h, w] to
+            Keras [h, w, in, out] format.
+
+        Example:
+            >>> model = make_yolov3_model()
+            >>> reader = WeightReader('yolov3.weights')
+            >>> reader.load_weights(model)
+        """
         for i in range(106):
             try:
                 conv_layer = model.get_layer('conv_' + str(i))
@@ -73,18 +129,52 @@ class WeightReader:
                     kernel = kernel.transpose([2,3,1,0])
                     conv_layer.set_weights([kernel])
             except ValueError:
-                logging.debug(f"No convolution #{i}")     
-    
+                logging.debug(f"No convolution #{i}")
+
     def reset(self):
+        """Reset read offset to beginning of weight array."""
         self.offset = 0
 
 class BoundBox:
+    """
+    Represents a bounding box detection with class probabilities.
+
+    Stores bounding box coordinates along with objectness score and
+    class probabilities for all COCO classes. Provides cached access
+    to predicted label and confidence score.
+
+    Attributes:
+        xmin (float): Left coordinate (normalized 0-1 or pixel coordinates)
+        ymin (float): Top coordinate
+        xmax (float): Right coordinate
+        ymax (float): Bottom coordinate
+        objness (float): Objectness score (probability of containing an object)
+        classes (np.ndarray): Array of class probabilities (80 classes for COCO)
+        label (int): Cached predicted class index (-1 until computed)
+        score (float): Cached confidence score (-1 until computed)
+
+    Example:
+        >>> box = BoundBox(0.1, 0.2, 0.5, 0.8, 0.95, class_probs)
+        >>> print(f"Class: {box.get_label()}, Confidence: {box.get_score():.2f}")
+        >>> print(f"Box: ({box.xmin}, {box.ymin}, {box.xmax}, {box.ymax})")
+    """
     def __init__(self, xmin, ymin, xmax, ymax, objness = None, classes = None):
+        """
+        Initialize bounding box with coordinates and predictions.
+
+        Args:
+            xmin (float): Left edge of box
+            ymin (float): Top edge of box
+            xmax (float): Right edge of box
+            ymax (float): Bottom edge of box
+            objness (float, optional): Objectness score
+            classes (np.ndarray, optional): Class probability array
+        """
         self.xmin = xmin
         self.ymin = ymin
         self.xmax = xmax
         self.ymax = ymax
-        
+
         self.objness = objness
         self.classes = classes
 
@@ -92,32 +182,76 @@ class BoundBox:
         self.score = -1
 
     def get_label(self):
+        """
+        Get predicted class label (index with highest probability).
+
+        Returns:
+            int: Class index (0-79 for COCO dataset)
+
+        Note:
+            Result is cached for efficiency.
+        """
         if self.label == -1:
             self.label = np.argmax(self.classes)
-        
+
         return self.label
-    
+
     def get_score(self):
+        """
+        Get confidence score for predicted class.
+
+        Returns:
+            float: Confidence score (0-1)
+
+        Note:
+            Combines objectness and class probability.
+            Result is cached for efficiency.
+        """
         if self.score == -1:
             self.score = self.classes[self.get_label()]
-            
+
         return self.score
 
 def _conv_block(inp, convs, skip=True):
+    """
+    Create a convolutional block for YOLOv3 architecture.
+
+    This function constructs a sequence of convolutional layers with optional
+    batch normalization and LeakyReLU activation. It can also add a skip
+    connection (residual connection) for better gradient flow.
+
+    Args:
+        inp: Input tensor from previous layer
+        convs (list): List of dictionaries defining convolution layers.
+            Each dict should contain:
+                - filter (int): Number of filters
+                - kernel (int): Kernel size
+                - stride (int): Stride value
+                - bnorm (bool): Whether to use batch normalization
+                - leaky (bool): Whether to use LeakyReLU activation
+                - layer_idx (int): Layer index for naming
+        skip (bool): If True, add skip connection. Default: True
+
+    Returns:
+        Tensor: Output tensor after applying all convolutions
+
+    Note:
+        Uses peculiar padding (left and top) to match Darknet implementation.
+    """
     x = inp
     count = 0
-    
+
     for conv in convs:
         if count == (len(convs) - 2) and skip:
             skip_connection = x
         count += 1
-        
+
         if conv['stride'] > 1: x = ZeroPadding2D(((1,0),(1,0)))(x) # peculiar padding as darknet prefer left and top
-        x = Conv2D(conv['filter'], 
-                   conv['kernel'], 
-                   strides=conv['stride'], 
+        x = Conv2D(conv['filter'],
+                   conv['kernel'],
+                   strides=conv['stride'],
                    padding='valid' if conv['stride'] > 1 else 'same', # peculiar padding as darknet prefer left and top
-                   name='conv_' + str(conv['layer_idx']), 
+                   name='conv_' + str(conv['layer_idx']),
                    use_bias=False if conv['bnorm'] else True)(x)
         if conv['bnorm']: x = BatchNormalization(epsilon=0.001, name='bnorm_' + str(conv['layer_idx']))(x)
         if conv['leaky']: x = LeakyReLU(alpha=0.1, name='leaky_' + str(conv['layer_idx']))(x)
@@ -125,6 +259,25 @@ def _conv_block(inp, convs, skip=True):
     return Add()([skip_connection, x]) if skip else x
 
 def _interval_overlap(interval_a, interval_b):
+    """
+    Calculate the overlap between two 1D intervals.
+
+    Used as a helper function for computing Intersection over Union (IoU)
+    between bounding boxes.
+
+    Args:
+        interval_a (tuple): First interval as (start, end)
+        interval_b (tuple): Second interval as (start, end)
+
+    Returns:
+        float: Length of overlap between intervals. Returns 0 if no overlap.
+
+    Example:
+        >>> _interval_overlap((0, 10), (5, 15))
+        5
+        >>> _interval_overlap((0, 5), (10, 15))
+        0
+    """
     x1, x2 = interval_a
     x3, x4 = interval_b
 
@@ -140,22 +293,90 @@ def _interval_overlap(interval_a, interval_b):
             return min(x2,x4) - x3          
 
 def _sigmoid(x):
+    """
+    Apply sigmoid activation function.
+
+    Args:
+        x (np.ndarray or float): Input value(s)
+
+    Returns:
+        np.ndarray or float: Sigmoid activation output in range (0, 1)
+
+    Example:
+        >>> _sigmoid(0)
+        0.5
+        >>> _sigmoid(np.array([0, 1, -1]))
+        array([0.5, 0.73105858, 0.26894142])
+    """
     return 1. / (1. + np.exp(-x))
 
 def bbox_iou(box1, box2):
+    """
+    Calculate Intersection over Union (IoU) between two bounding boxes.
+
+    IoU is a measure of overlap between two bounding boxes, commonly used
+    in object detection for Non-Maximum Suppression (NMS).
+
+    Args:
+        box1 (BoundBox): First bounding box
+        box2 (BoundBox): Second bounding box
+
+    Returns:
+        float: IoU score between 0 and 1.
+            - 0 means no overlap
+            - 1 means perfect overlap
+
+    Formula:
+        IoU = Area of Intersection / Area of Union
+
+    Example:
+        >>> box1 = BoundBox(0, 0, 10, 10)
+        >>> box2 = BoundBox(5, 5, 15, 15)
+        >>> iou = bbox_iou(box1, box2)
+        >>> print(f"IoU: {iou:.2f}")
+    """
     intersect_w = _interval_overlap([box1.xmin, box1.xmax], [box2.xmin, box2.xmax])
     intersect_h = _interval_overlap([box1.ymin, box1.ymax], [box2.ymin, box2.ymax])
-    
+
     intersect = intersect_w * intersect_h
 
     w1, h1 = box1.xmax-box1.xmin, box1.ymax-box1.ymin
     w2, h2 = box2.xmax-box2.xmin, box2.ymax-box2.ymin
-    
+
     union = w1*h1 + w2*h2 - intersect
-    
+
     return float(intersect) / union
 
 def make_yolov3_model():
+    """
+    Construct the YOLOv3 (Darknet-53) neural network architecture.
+
+    This function builds the complete YOLOv3 model with 106 convolutional layers
+    organized in a Darknet-53 backbone with three detection heads for different
+    scales (small, medium, and large objects).
+
+    Returns:
+        keras.Model: YOLOv3 model with three outputs:
+            - yolo_82: Large object detection (13x13 grid)
+            - yolo_94: Medium object detection (26x26 grid)
+            - yolo_106: Small object detection (52x52 grid)
+
+    Architecture:
+        - Input: Variable size RGB image (H, W, 3)
+        - Backbone: Darknet-53 (53 convolutional layers)
+        - Detection heads: 3 scales with different receptive fields
+        - Output: 3 tensors for multi-scale detection
+
+    Note:
+        Model requires pre-trained weights from COCO dataset.
+        Use WeightReader.load_weights() to load weights after creation.
+
+    Example:
+        >>> model = make_yolov3_model()
+        >>> print(f"Total parameters: {model.count_params():,}")
+        >>> weight_reader = WeightReader('yolov3.weights')
+        >>> weight_reader.load_weights(model)
+    """
     input_image = Input(shape=(None, None, 3))
 
     # Layer  0 => 4
@@ -252,6 +473,31 @@ def make_yolov3_model():
     return model
 
 def preprocess_input(image, net_h, net_w):
+    """
+    Preprocess input image for YOLOv3 detection.
+
+    Resizes image to network input size while maintaining aspect ratio using
+    letterboxing (padding with gray). Converts BGR to RGB and normalizes
+    pixel values to [0, 1].
+
+    Args:
+        image (np.ndarray): Input image in BGR format (H, W, 3)
+        net_h (int): Network input height (typically 416)
+        net_w (int): Network input width (typically 416)
+
+    Returns:
+        np.ndarray: Preprocessed image with shape (1, net_h, net_w, 3)
+            - Normalized to [0, 1]
+            - RGB format
+            - Letterboxed to maintain aspect ratio
+            - Batch dimension added
+
+    Example:
+        >>> frame = cv2.imread('image.jpg')  # (720, 1280, 3)
+        >>> preprocessed = preprocess_input(frame, 416, 416)
+        >>> print(preprocessed.shape)
+        (1, 416, 416, 3)
+    """
     new_h, new_w, _ = image.shape
 
     # determine the new size of the image
@@ -273,6 +519,35 @@ def preprocess_input(image, net_h, net_w):
     return new_image
 
 def decode_netout(netout, anchors, obj_thresh, nms_thresh, net_h, net_w):
+    """
+    Decode YOLOv3 network output into bounding boxes.
+
+    Converts raw network predictions into interpretable bounding boxes with
+    class probabilities. Applies objectness threshold to filter low-confidence
+    detections.
+
+    Args:
+        netout (np.ndarray): Network output tensor (grid_h, grid_w, 255)
+        anchors (list): Anchor box dimensions for this scale [w1,h1, w2,h2, w3,h3]
+        obj_thresh (float): Objectness threshold (0-1) for filtering detections
+        nms_thresh (float): NMS threshold (not used in this function)
+        net_h (int): Network input height
+        net_w (int): Network input width
+
+    Returns:
+        list[BoundBox]: List of detected bounding boxes with class probabilities
+
+    Note:
+        Each grid cell predicts 3 bounding boxes (one per anchor).
+        Output shape 255 = 3 * (5 + 80) where:
+            - 5 = (x, y, w, h, objectness)
+            - 80 = class probabilities for COCO dataset
+
+    Example:
+        >>> yolos = model.predict(preprocessed_image)
+        >>> boxes = decode_netout(yolos[0][0], anchors[0], 0.5, 0.45, 416, 416)
+        >>> print(f"Detected {len(boxes)} boxes")
+    """
     grid_h, grid_w = netout.shape[:2]
     nb_box = 3
     netout = netout.reshape((grid_h, grid_w, nb_box, -1))
@@ -315,28 +590,85 @@ def decode_netout(netout, anchors, obj_thresh, nms_thresh, net_h, net_w):
     return boxes
 
 def correct_yolo_boxes(boxes, image_h, image_w, net_h, net_w):
+    """
+    Correct bounding box coordinates to match original image dimensions.
+
+    YOLOv3 predictions are relative to the letterboxed image. This function
+    transforms coordinates back to the original image space, accounting for
+    the letterboxing (padding) applied during preprocessing.
+
+    Args:
+        boxes (list[BoundBox]): List of bounding boxes to correct (modified in-place)
+        image_h (int): Original image height
+        image_w (int): Original image width
+        net_h (int): Network input height (e.g., 416)
+        net_w (int): Network input width (e.g., 416)
+
+    Returns:
+        None: Modifies boxes in-place
+
+    Note:
+        This function accounts for the aspect-ratio-preserving resize and
+        letterboxing applied in preprocess_input().
+
+    Example:
+        >>> boxes = decode_netout(...)  # boxes in network coordinates
+        >>> correct_yolo_boxes(boxes, 720, 1280, 416, 416)
+        >>> # boxes now in original image coordinates (0-720, 0-1280)
+    """
     if (float(net_w)/image_w) < (float(net_h)/image_h):
         new_w = net_w
         new_h = (image_h*net_w)/image_w
     else:
         new_h = net_w
         new_w = (image_w*net_h)/image_h
-        
+
     for i in range(len(boxes)):
         x_offset, x_scale = (net_w - new_w)/2./net_w, float(new_w)/net_w
         y_offset, y_scale = (net_h - new_h)/2./net_h, float(new_h)/net_h
-        
+
         boxes[i].xmin = int((boxes[i].xmin - x_offset) / x_scale * image_w)
         boxes[i].xmax = int((boxes[i].xmax - x_offset) / x_scale * image_w)
         boxes[i].ymin = int((boxes[i].ymin - y_offset) / y_scale * image_h)
         boxes[i].ymax = int((boxes[i].ymax - y_offset) / y_scale * image_h)
         
 def do_nms(boxes, nms_thresh):
+    """
+    Apply Non-Maximum Suppression (NMS) to remove duplicate detections.
+
+    NMS suppresses overlapping bounding boxes, keeping only the highest
+    confidence detection for each object. Applied per-class to handle
+    multi-class detection scenarios.
+
+    Args:
+        boxes (list[BoundBox]): List of bounding boxes (modified in-place)
+        nms_thresh (float): IoU threshold (0-1) for suppression.
+            - Higher values = more aggressive suppression
+            - Typical value: 0.45
+
+    Returns:
+        None: Modifies boxes in-place by zeroing out class probabilities
+              of suppressed boxes
+
+    Algorithm:
+        For each class:
+        1. Sort boxes by class probability (descending)
+        2. For each box, suppress all lower-scoring boxes with IoU > threshold
+        3. Suppressed boxes have their class probability set to 0
+
+    Example:
+        >>> boxes = decode_netout(...)
+        >>> print(f"Before NMS: {len(boxes)} boxes")
+        >>> do_nms(boxes, 0.45)
+        >>> # Filter out suppressed boxes
+        >>> boxes = [box for box in boxes if box.get_score() > 0]
+        >>> print(f"After NMS: {len(boxes)} boxes")
+    """
     if len(boxes) > 0:
         nb_class = len(boxes[0].classes)
     else:
         return
-        
+
     for c in range(nb_class):
         sorted_indices = np.argsort([-box.classes[c] for box in boxes])
 
@@ -352,6 +684,42 @@ def do_nms(boxes, nms_thresh):
                     boxes[index_j].classes[c] = 0
                     
 def draw_boxes(image, boxes, line, labels, obj_thresh, dcnt):
+    """
+    Draw bounding boxes on image and detect traffic violations.
+
+    Draws detection boxes on the image with different colors:
+    - Green: Compliant vehicles (not crossing line)
+    - Red: Violation detected (crossing traffic signal line)
+
+    Also draws the traffic signal line and saves violation snapshots.
+
+    Args:
+        image (np.ndarray): Input image (will be modified in-place)
+        boxes (list[BoundBox]): List of detected bounding boxes
+        line (list): Traffic line coordinates [(x1, y1), (x2, y2)]
+        labels (list[str]): Class label names (COCO labels)
+        obj_thresh (float): Confidence threshold for displaying boxes
+        dcnt (int): Frame counter for naming violation snapshots
+
+    Returns:
+        np.ndarray: Annotated image with boxes and line drawn
+
+    Side Effects:
+        - Saves violation snapshots to config.DETECTED_IMAGES_DIR
+        - Displays violation window with cv2.imshow (if not headless)
+
+    Violation Detection:
+        A violation is detected when any edge of a vehicle's bounding box
+        intersects with the traffic signal line, indicating the vehicle
+        has crossed the red signal.
+
+    Example:
+        >>> frame = cv2.imread('traffic.jpg')
+        >>> boxes = [...]  # After detection and NMS
+        >>> line = [(100, 200), (500, 200)]  # Horizontal line
+        >>> annotated = draw_boxes(frame, boxes, line, LABELS, 0.5, 1)
+        >>> cv2.imwrite('annotated.jpg', annotated)
+    """
     logging.debug(f"Drawing boxes with line: {line}")
 
     for box in boxes:
