@@ -30,7 +30,7 @@ import numpy as np
 
 # Import project modules
 import config
-from object_detection import (
+from detection import (
     detector,
     preprocess_input,
     decode_netout,
