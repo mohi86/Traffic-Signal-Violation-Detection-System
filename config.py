@@ -18,6 +18,7 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 # Model weights
 WEIGHTS_DIR = PROJECT_ROOT / "weights"
 YOLOV3_WEIGHTS_PATH = WEIGHTS_DIR / "yolov3.weights"
+WEIGHTS_PATH = YOLOV3_WEIGHTS_PATH  # Alias for backward compatibility
 
 # Resources directories
 RESOURCES_DIR = PROJECT_ROOT / "Resources"
@@ -176,6 +177,129 @@ def get_violation_image_path(frame_number):
 
 # Ensure all directories exist when config is imported
 ensure_directories()
+
+
+# ============================================================================
+# GPU CONFIGURATION
+# ============================================================================
+
+def configure_gpu():
+    """
+    Configure GPU settings for TensorFlow.
+
+    Automatically detects available GPUs and configures:
+    - Memory growth to prevent OOM errors
+    - Optional memory limit
+    - Multi-GPU selection
+
+    Returns:
+        list: Names of available GPU devices
+
+    Example:
+        >>> gpus = configure_gpu()
+        >>> print(f"Using {len(gpus)} GPU(s)")
+    """
+    import logging
+
+    try:
+        import tensorflow as tf
+    except ImportError:
+        logging.warning("TensorFlow not installed. GPU configuration skipped.")
+        return []
+
+    # Reduce TensorFlow logging
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+    try:
+        # List all physical GPUs
+        gpus = tf.config.list_physical_devices('GPU')
+
+        if not gpus:
+            logging.info("No GPU detected. Running on CPU.")
+            return []
+
+        if not USE_GPU:
+            # Force CPU mode
+            logging.info("GPU available but USE_GPU=False. Running on CPU.")
+            tf.config.set_visible_devices([], 'GPU')
+            return []
+
+        # Configure each GPU
+        gpu_names = []
+
+        for gpu in gpus:
+            gpu_name = gpu.name
+            gpu_names.append(gpu_name)
+
+            # Enable memory growth (allocate memory as needed)
+            # This prevents TensorFlow from allocating all GPU memory at once
+            if GPU_MEMORY_GROWTH:
+                tf.config.experimental.set_memory_growth(gpu, True)
+
+            logging.info(f"✅ GPU configured: {gpu_name}")
+
+        # Log GPU details
+        logging.info(f"TensorFlow GPU support: {tf.test.is_built_with_cuda()}")
+        logging.info(f"GPUs available: {len(gpus)}")
+
+        for i, gpu in enumerate(gpus):
+            logging.info(f"  GPU {i}: {gpu.name}")
+
+        return gpu_names
+
+    except RuntimeError as e:
+        # Memory growth must be set before GPUs are initialized
+        logging.error(f"GPU configuration error: {e}")
+        logging.info("Falling back to CPU mode")
+        return []
+
+    except Exception as e:
+        logging.error(f"Unexpected GPU configuration error: {e}")
+        logging.info("Falling back to CPU mode")
+        return []
+
+
+def get_device_info():
+    """
+    Get detailed information about computation device.
+
+    Returns:
+        dict: Device information
+            {
+                'device_type': str ('GPU' or 'CPU'),
+                'device_count': int,
+                'device_names': list[str],
+                'tensorflow_version': str,
+                'cuda_available': bool
+            }
+
+    Example:
+        >>> info = get_device_info()
+        >>> print(f"Running on {info['device_type']}")
+    """
+    try:
+        import tensorflow as tf
+
+        gpus = tf.config.list_physical_devices('GPU')
+
+        info = {
+            'device_type': 'GPU' if (gpus and USE_GPU) else 'CPU',
+            'device_count': len(gpus) if gpus else 0,
+            'device_names': [gpu.name for gpu in gpus] if gpus else [],
+            'tensorflow_version': tf.__version__,
+            'cuda_available': tf.test.is_built_with_cuda()
+        }
+
+        return info
+
+    except ImportError:
+        return {
+            'device_type': 'CPU',
+            'device_count': 0,
+            'device_names': [],
+            'tensorflow_version': 'not installed',
+            'cuda_available': False
+        }
 
 
 # ============================================================================

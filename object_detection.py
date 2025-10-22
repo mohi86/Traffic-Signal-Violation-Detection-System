@@ -8,6 +8,17 @@ import logging
 from utils.geometry import bounding_box_intersects_line
 import config
 
+# ============================================================================
+# GPU Configuration (must be done before model loading)
+# ============================================================================
+
+# Configure GPU before any TensorFlow operations
+_gpus = config.configure_gpu()
+if _gpus:
+    logging.info(f"YOLOv3 will use GPU acceleration: {_gpus}")
+else:
+    logging.info("YOLOv3 will run on CPU")
+
 class WeightReader:
     def __init__(self, weight_file):
         with open(weight_file, 'rb') as w_f:
