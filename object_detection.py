@@ -1,9 +1,9 @@
 import numpy as np
-from keras.layers import Conv2D, Input, BatchNormalization, LeakyReLU, ZeroPadding2D, UpSampling2D
-from keras.layers.merge import add, concatenate
-from keras.models import Model
+from tensorflow.keras.layers import Conv2D, Input, BatchNormalization, LeakyReLU, ZeroPadding2D, UpSampling2D, Add, Concatenate
+from tensorflow.keras.models import Model
 import struct
 import cv2
+from utils.geometry import bounding_box_intersects_line
 
 class WeightReader:
     def __init__(self, weight_file):
@@ -108,7 +108,7 @@ def _conv_block(inp, convs, skip=True):
         if conv['bnorm']: x = BatchNormalization(epsilon=0.001, name='bnorm_' + str(conv['layer_idx']))(x)
         if conv['leaky']: x = LeakyReLU(alpha=0.1, name='leaky_' + str(conv['layer_idx']))(x)
 
-    return add([skip_connection, x]) if skip else x
+    return Add()([skip_connection, x]) if skip else x
 
 def _interval_overlap(interval_a, interval_b):
     x1, x2 = interval_a
@@ -207,7 +207,7 @@ def make_yolov3_model():
     # Layer 83 => 86
     x = _conv_block(x, [{'filter': 256, 'kernel': 1, 'stride': 1, 'bnorm': True, 'leaky': True, 'layer_idx': 84}], skip=False)
     x = UpSampling2D(2)(x)
-    x = concatenate([x, skip_61])
+    x = Concatenate()([x, skip_61])
 
     # Layer 87 => 91
     x = _conv_block(x, [{'filter': 256, 'kernel': 1, 'stride': 1, 'bnorm': True, 'leaky': True, 'layer_idx': 87},
@@ -223,7 +223,7 @@ def make_yolov3_model():
     # Layer 95 => 98
     x = _conv_block(x, [{'filter': 128, 'kernel': 1, 'stride': 1, 'bnorm': True, 'leaky': True,   'layer_idx': 96}], skip=False)
     x = UpSampling2D(2)(x)
-    x = concatenate([x, skip_36])
+    x = Concatenate()([x, skip_36])
 
     # Layer 99 => 106
     yolo_106 = _conv_block(x, [{'filter': 128, 'kernel': 1, 'stride': 1, 'bnorm': True,  'leaky': True,  'layer_idx': 99},
@@ -272,7 +272,7 @@ def decode_netout(netout, anchors, obj_thresh, nms_thresh, net_h, net_w):
     netout[..., 5:] *= netout[..., 5:] > obj_thresh
 
     for i in range(grid_h*grid_w):
-        row = i / grid_w
+        row = i // grid_w  # Integer division
         col = i % grid_w
         
         for b in range(nb_box):
@@ -354,22 +354,17 @@ def draw_boxes(image, boxes, line, labels, obj_thresh, dcnt):
                 print()
                 
         if label >= 0:
-            tf = False
+            # Check if bounding box intersects with traffic signal line
+            bbox_min = (box.xmin, box.ymin)
+            bbox_max = (box.xmax, box.ymax)
+            is_violation = bounding_box_intersects_line(bbox_min, bbox_max, line[0], line[1])
 
-            (rxmin, rymin) = (box.xmin, box.ymin)
-            (rxmax, rymax) = (box.xmax, box.ymax)
-
-            tf = False
-            tf |= intersection(line[0], line[1], (rxmin, rymin), (rxmin, rymax))
-            tf |= intersection(line[0], line[1], (rxmax, rymin), (rxmax, rymax))
-            tf |= intersection(line[0], line[1], (rxmin, rymin), (rxmax, rymin))
-            tf |= intersection(line[0], line[1], (rxmin, rymax), (rxmax, rymax))
-
-            print(tf)
+            print(f"Violation detected: {is_violation}")
 
             cv2.line(image, line[0], line[1], (255, 0, 0), 3)
 
-            if tf:
+            if is_violation:
+                # Red box for violation
                 cv2.rectangle(image, (box.xmin,box.ymin), (box.xmax,box.ymax), (255,0,0), 3)
                 cimg = image[box.ymin:box.ymax, box.xmin:box.xmax]
                 cv2.imshow("violation", cimg)
@@ -377,6 +372,7 @@ def draw_boxes(image, boxes, line, labels, obj_thresh, dcnt):
                 cv2.imwrite("G:/Traffic Violation Detection/Traffic Signal Violation Detection System/Detected Images/violation_"+str(dcnt)+".jpg", cimg)
                 dcnt = dcnt+1
             else:
+                # Green box for compliant vehicle
                 cv2.rectangle(image, (box.xmin,box.ymin), (box.xmax,box.ymax), (0,255,0), 3)
 
             cv2.putText(image, 
@@ -411,48 +407,4 @@ yolov3 = make_yolov3_model()
 weight_reader = WeightReader(weights_path)
 weight_reader.load_weights(yolov3)
 
-# my defined functions
-def intersection(p, q, r, t):
-    print(p, q, r, t)
-    (x1, y1) = p
-    (x2, y2) = q
-
-    (x3, y3) = r
-    (x4, y4) = t
-
-    a1 = y1-y2
-    b1 = x2-x1
-    c1 = x1*y2-x2*y1
-
-    a2 = y3-y4
-    b2 = x4-x3
-    c2 = x3*y4-x4*y3
-
-    if(a1*b2-a2*b1 == 0):
-        return False
-    print((a1, b1, c1), (a2, b2, c2))
-    x = (b1*c2 - b2*c1) / (a1*b2 - a2*b1)
-    y = (a2*c1 - a1*c2) / (a1*b2 - a2*b1)
-    print((x, y))
-
-    if x1 > x2:
-        tmp = x1
-        x1 = x2
-        x2 = tmp
-    if y1 > y2:
-        tmp = y1
-        y1 = y2
-        y2 = tmp
-    if x3 > x4:
-        tmp = x3
-        x3 = x4
-        x4 = tmp
-    if y3 > y4:
-        tmp = y3
-        y3 = y4
-        y4 = tmp
-
-    if x >= x1 and x <= x2 and y >= y1 and y <= y2 and x >= x3 and x <= x4 and y >= y3 and y <= y4:
-        return True
-    else:
-        return False
+# Geometry functions are now in utils/geometry.py module
